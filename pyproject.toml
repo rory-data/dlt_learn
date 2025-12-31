@@ -1,0 +1,107 @@
+[project]
+name = "dlt-learn"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alive-progress>=3.3.0",
+    "dlt[duckdb, workspace,cli]>=1.20.0",
+    "loguru>=0.7.3",
+    "marimo>=0.18.4",
+]
+
+[dependency-groups]
+dev = [
+    "prek>=0.2.23",
+    "pytest>=7.2.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.14.10",
+    "ty>=0.0.7",
+]
+
+[tool.uv]
+package = false
+ 
+[tool.ruff]
+# Ruff configuration
+target-version = "py313"
+line-length = 88
+fix = true
+ 
+[tool.ruff.lint]
+select = [
+    "A",   # flake8-builtins
+    "AIR", # Airflow-specific rules
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "C90", # flake8-cognitive-complexity (mccabe)
+    "D",   # pydocstyle
+    "DTZ", # flake8-datetime timezones
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "FBT", # flake8-boolean-trap
+    "G",   # flake8-logging-format
+    "I",   # isort
+    "LOG", # flake8-logging
+    "N",   # pep8-naming
+    "PT",  # flake8-pytest-style
+    "PTH", # flake8-use-pathlib
+    "RUF", # ruff-specific rules
+    "S",   # flake8-bandit
+    "SIM", # flake8-simplify
+    "T20", # flake8-print
+    "TRY", # tryceratops-exception-antipatterns
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "D203", # one-blank-line-before-class (conflicts with D211)
+    "D212", # multi-line-summary-first-line (conflicts with D213)
+    "E501", # line-too-long
+]
+
+[tool.ruff.format]
+quote-style = "double"  # like Black, use double quotes for strings.
+indent-style = "space"  # like Black, indent with spaces.
+skip-magic-trailing-comma = false  # like Black, respect magic trailing commas.
+line-ending = "auto"  # like Black, automatically detect the appropriate line ending.
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
+ 
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"] # unused import in __init__ files
+"tests/*" = ["S101", "ANN", "S603"] # assert usage and type annotations in tests
+"conftest.py" = [
+    "S101",
+    "ANN",
+] # assert usage and type annotations in pytest config
+ 
+[tool.ruff.lint.isort]
+known-first-party = ["dlt_learn"]
+known-third-party = ["pytest", "requests"]
+ 
+[tool.ruff.lint.pydocstyle]
+convention = "google" # Use Google-style docstrings
+ 
+[tool.ty.src]
+include = ["dlt_learn", "tests"]
+ 
+[tool.pytest.ini_options]
+pythonpath = [".", "dlt_learn"]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+python_classes = "Test*"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "def __repr__",
+    "pragma: no cover",
+    "RaiseAssertionError",
+    "RaiseNotImplementedError",
+]
+
