@@ -1,6 +1,5 @@
 """Multi-record source with safe Arrow streaming."""
 
-import io
 from contextlib import contextmanager
 
 import dlt
@@ -63,7 +62,8 @@ def get_max_fields_for_type(record_type: str, file_path: str) -> int:
         Maximum number of fields for this record type
     """
     with duckdb_connection() as con:
-        result = con.execute(
+        # Note: file_path and record_type are trusted inputs from the pipeline
+        result = con.execute(  # noqa: S608
             f"SELECT MAX(array_length(string_split(column0, '|'))) as max_fields "
             f"FROM read_csv('{file_path}', header=false, sep='\\n') "
             f"WHERE column0 LIKE '{record_type}|%'"
@@ -83,12 +83,12 @@ def create_batch_generator(
         max_fields: Pre-computed maximum field count (for stable schema)
 
     Yields:
-        Safe deep-copied Arrow RecordBatch objects
+        Safe deep-copied Arrow Table objects (converted from RecordBatch for better serialization)
     """
     con = duckdb.connect(":memory:")
     batch_count = 0
     total_rows = 0
-    
+
     try:
         # Read and filter data
         full_table = con.read_csv(file_path, header=False, sep="\n")
@@ -121,12 +121,18 @@ def create_batch_generator(
             # CRITICAL: Deep copy to decouple from DuckDB's reused buffers
             safe_batch = safe_copy_batch(extracted_batch)
 
+            # Convert batch to Table for better serialization through dlt's spawn process
+            # Tables are more stable than batches when pickled/unpickled across processes
+            safe_table = pa.Table.from_batches([safe_batch])
+
             batch_count += 1
-            total_rows += safe_batch.num_rows
+            total_rows += safe_table.num_rows
             logger.info(
-                f"Record type {record_type}: batch {batch_count} ({safe_batch.num_rows} rows, {total_rows}/{expected_count} total)"
+                f"Record type {record_type}: batch {batch_count} ({safe_table.num_rows} rows, {total_rows}/{expected_count} total)"
             )
-            yield safe_batch
+
+            # Yield as Arrow Table for better compatibility with dlt
+            yield safe_table
 
         # Validate all rows were yielded
         if total_rows != expected_count:
@@ -141,7 +147,7 @@ def create_batch_generator(
         logger.success(
             f"Record type {record_type}: Successfully yielded all {total_rows} rows in {batch_count} batches"
         )
-        
+
     except Exception as e:
         logger.error(
             f"Record type {record_type}: Error during batch generation after {batch_count} batches ({total_rows} rows): {e}"
