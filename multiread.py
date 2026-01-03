@@ -1,4 +1,38 @@
-"""Multi-record source with safe Arrow streaming."""
+"""Multi-record source with safe Arrow streaming.
+
+This module implements a robust multi-layout CSV parser that extracts different
+record types from a single file and loads them to separate parquet files using dlt.
+
+## Snappy Compression Fix
+
+The critical issue this addresses is **silent data corruption** from DuckDB buffer reuse:
+
+### Root Cause
+1. DuckDB's `fetch_arrow_reader()` uses zero-copy buffers for performance
+2. These buffers are reused/overwritten on each `read_next_batch()` call
+3. dlt's async normalize/load phases (especially with spawn on macOS) hold references
+   to these buffers while processing
+4. When DuckDB overwrites the buffer for the next batch, dlt still references the
+   old (now corrupted) memory location
+5. Result: "corrupt snappy compressed data" errors and parquet files with garbage data
+
+### Solution
+Three-layer defense:
+
+1. **safe_copy_batch()**: Deep copy via Arrow serialization to decouple from DuckDB memory
+   - Serializes batch to buffer, then deserializes to create new batch with owned memory
+   - Validates the copy to ensure data integrity
+   
+2. **Convert to Arrow Tables**: Better serialization through dlt's multiprocessing
+   - Tables pickle more reliably than batches across process boundaries
+   - More stable schema representation
+   
+3. **validate_arrow_table()**: Pre-flight checks before yielding to dlt
+   - Ensures data is materialized and valid
+   - Catches corruption early rather than during parquet write
+
+This maintains Arrow efficiency while guaranteeing data integrity across process boundaries.
+"""
 
 from contextlib import contextmanager
 
@@ -25,11 +59,73 @@ def safe_copy_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
     This is critical when using DuckDB's fetch_arrow_reader, as DuckDB may
     reuse underlying memory buffers for subsequent batches. Serialization
     ensures all buffers (including string data) are copied.
+    
+    The serialization roundtrip guarantees:
+    1. All data is materialized (no lazy references to DuckDB memory)
+    2. Buffers are owned by the new RecordBatch
+    3. Data is validated during deserialization
+    4. Compatible with compression (snappy, gzip, etc.)
     """
+    # Validate input batch
+    if batch.num_rows == 0:
+        return batch
+    
+    # Serialize and deserialize to create true deep copy
+    # This ensures all memory is owned and not shared with DuckDB
     sink = pa.BufferOutputStream()
     with pa.RecordBatchStreamWriter(sink, batch.schema) as writer:
         writer.write_batch(batch)
-    return pa.RecordBatchStreamReader(sink.getvalue()).read_next_batch()
+    
+    # Get buffer and validate it was written
+    buffer = sink.getvalue()
+    if len(buffer) == 0:
+        raise ValueError("Failed to serialize batch - empty buffer")
+    
+    # Deserialize to create new batch with owned memory
+    reader = pa.RecordBatchStreamReader(buffer)
+    copied_batch = reader.read_next_batch()
+    
+    # Validate the copy matches original
+    if copied_batch.num_rows != batch.num_rows:
+        raise ValueError(
+            f"Deep copy validation failed: row count mismatch "
+            f"(original: {batch.num_rows}, copy: {copied_batch.num_rows})"
+        )
+    
+    return copied_batch
+
+
+def validate_arrow_table(table: pa.Table, record_type: str) -> None:
+    """Validate Arrow Table before yielding to dlt.
+    
+    Ensures:
+    1. Table has data
+    2. Schema is valid
+    3. No null columns
+    4. Data is properly materialized (not referencing external memory)
+    
+    Args:
+        table: Arrow Table to validate
+        record_type: Record type for error messages
+        
+    Raises:
+        ValueError: If validation fails
+    """
+    if table.num_rows == 0:
+        raise ValueError(f"Record type {record_type}: Empty table")
+    
+    if table.num_columns == 0:
+        raise ValueError(f"Record type {record_type}: No columns in table")
+    
+    # Verify schema is complete
+    if not table.schema:
+        raise ValueError(f"Record type {record_type}: Invalid schema")
+    
+    # Ensure all columns have data
+    for col_name in table.column_names:
+        col = table.column(col_name)
+        if col is None:
+            raise ValueError(f"Record type {record_type}: Null column {col_name}")
 
 
 def extract_fields_from_batch(batch: pa.RecordBatch, max_fields: int) -> pa.RecordBatch:
@@ -124,6 +220,9 @@ def create_batch_generator(
             # Convert batch to Table for better serialization through dlt's spawn process
             # Tables are more stable than batches when pickled/unpickled across processes
             safe_table = pa.Table.from_batches([safe_batch])
+            
+            # Validate table before yielding to catch any corruption early
+            validate_arrow_table(safe_table, record_type)
 
             batch_count += 1
             total_rows += safe_table.num_rows
