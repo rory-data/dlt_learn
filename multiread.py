@@ -1,0 +1,229 @@
+"""Multi-record source with safe Arrow streaming."""
+
+import io
+from contextlib import contextmanager
+
+import dlt
+import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+from loguru import logger
+
+
+@contextmanager
+def duckdb_connection():
+    """Context manager for DuckDB connections with proper lifecycle."""
+    con = duckdb.connect(":memory:")
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def safe_copy_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Creates a deep copy of a RecordBatch to decouple it from DuckDB memory.
+
+    This is critical when using DuckDB's fetch_arrow_reader, as DuckDB may
+    reuse underlying memory buffers for subsequent batches. Serialization
+    ensures all buffers (including string data) are copied.
+    """
+    sink = pa.BufferOutputStream()
+    with pa.RecordBatchStreamWriter(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return pa.RecordBatchStreamReader(sink.getvalue()).read_next_batch()
+
+
+def extract_fields_from_batch(batch: pa.RecordBatch, max_fields: int) -> pa.RecordBatch:
+    """Extract array column into separate field columns using Arrow compute."""
+    if batch.num_rows == 0:
+        return batch
+
+    fields_col = batch.column("fields_array")
+    extracted_arrays = []
+    extracted_names = []
+
+    for i in range(max_fields):
+        field_array = pc.list_element(fields_col, i)
+        if isinstance(field_array, pa.ChunkedArray):
+            field_array = field_array.combine_chunks()
+        extracted_arrays.append(field_array)
+        extracted_names.append(f"field_{i}")
+
+    return pa.RecordBatch.from_arrays(extracted_arrays, names=extracted_names)
+
+
+def get_max_fields_for_type(record_type: str, file_path: str) -> int:
+    """Get maximum field count for a record type (computed once per type).
+
+    Args:
+        record_type: The record type code to filter on
+        file_path: Path to the data file
+
+    Returns:
+        Maximum number of fields for this record type
+    """
+    with duckdb_connection() as con:
+        result = con.execute(
+            f"SELECT MAX(array_length(string_split(column0, '|'))) as max_fields "
+            f"FROM read_csv('{file_path}', header=false, sep='\\n') "
+            f"WHERE column0 LIKE '{record_type}|%'"
+        ).fetchall()
+        return result[0][0] or 0
+
+
+def create_batch_generator(
+    record_type: str, file_path: str, batch_size: int, max_fields: int
+):
+    """Create a generator function for a specific record type.
+
+    Args:
+        record_type: The record type code to filter on
+        file_path: Path to the data file
+        batch_size: Rows per batch
+        max_fields: Pre-computed maximum field count (for stable schema)
+
+    Yields:
+        Safe deep-copied Arrow RecordBatch objects
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        full_table = con.read_csv(file_path, header=False, sep="\n")
+        rel = full_table.filter(f"column0 LIKE '{record_type}|%'").select(
+            "string_split(column0, '|') AS fields_array"
+        )
+
+        reader = rel.fetch_arrow_reader(batch_size=batch_size)
+        batch_count = 0
+
+        while True:
+            try:
+                batch = reader.read_next_batch()
+            except StopIteration:
+                break
+
+            if batch.num_rows == 0:
+                break
+
+            # Transform: extract fields from array column
+            extracted_batch = extract_fields_from_batch(batch, max_fields)
+
+            # CRITICAL: Deep copy to decouple from DuckDB's reused buffers
+            safe_batch = safe_copy_batch(extracted_batch)
+
+            batch_count += 1
+            logger.info(
+                f"Record type {record_type}: batch {batch_count} ({safe_batch.num_rows} rows)"
+            )
+            yield safe_batch
+    finally:
+        con.close()
+
+
+def resource_generator_factory(
+    record_type: str, file_path: str, batch_size: int, max_fields: int
+):
+    """Factory function to create generator for a specific record type.
+
+    This function is called once per record type to create a callable generator.
+    dlt will call the returned callable once to get the generator.
+    """
+
+    def generator():
+        yield from create_batch_generator(
+            record_type, file_path, batch_size, max_fields
+        )
+
+    return generator
+
+
+@dlt.source
+def multi_source(record_types: list[str], file_path: str, batch_size: int = 50_000):
+    """Multi-record source with single file read and partitioned streaming.
+
+    Args:
+        record_types: List of record type codes to extract
+        file_path: Path to the multi-layout data file
+        batch_size: Number of rows per batch (DuckDB fetch_arrow_reader parameter)
+
+    Yields:
+        dlt resources with extracted and transformed data
+    """
+    # Pre-partition: for each record type, create a resource
+    for record_type in record_types:
+        try:
+            # Pre-compute max fields once per record type (eliminates schema drift)
+            max_fields = get_max_fields_for_type(record_type, file_path)
+
+            if max_fields == 0:
+                logger.warning(f"No records found for type {record_type}")
+                continue
+
+            logger.info(f"Found record type {record_type} (max {max_fields} fields)")
+
+            # Get generator factory
+            gen_func = resource_generator_factory(
+                record_type, file_path, batch_size, max_fields
+            )
+
+            # Yield resource with generator callable
+            yield dlt.resource(
+                gen_func,
+                name=f"record_{record_type}",
+                write_disposition="append",
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Failed to process record type {record_type}: {e}", exc_info=True
+            )
+            continue
+
+
+# Example pipeline
+if __name__ == "__main__":
+    record_types = (
+        "9001",
+        "9002",
+        "9004",
+        "9005",
+        "9006",
+        "9009",
+        "9012",
+        "9019",
+        "9020",
+        "9031",
+    )
+
+    # Define pipeline
+    pipeline = dlt.pipeline(
+        pipeline_name="multi_layout_pipeline",
+        destination="filesystem",
+        dataset_name="record_data",
+        progress="log",
+    )
+
+    # Run pipeline with all record types and custom batch size
+    # Note: write_disposition moved to per-resource level for better control
+    load_info = pipeline.run(
+        multi_source(
+            record_types=record_types,
+            file_path="/Users/rory/github/sandbox/multi_layout_data_xl.txt",
+            batch_size=25_000,  # Control batch size to manage memory
+        ),
+    )
+
+    logger.info("=" * 80)
+    logger.info("PIPELINE LOAD RESULTS")
+    logger.info("=" * 80)
+    logger.info(f"Load info: {load_info}")
+    logger.info(
+        f"Loads state: {load_info.loads_ids if hasattr(load_info, 'loads_ids') else 'N/A'}"
+    )
+
+    # Log package information
+    if hasattr(load_info, "failed_jobs"):
+        logger.info(f"Failed jobs: {load_info.failed_jobs}")
+    if hasattr(load_info, "has_successfully_loaded"):
+        logger.info(f"Successfully loaded: {load_info.has_successfully_loaded}")
+
+    logger.info("=" * 80)
