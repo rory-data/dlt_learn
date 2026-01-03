@@ -86,15 +86,26 @@ def create_batch_generator(
         Safe deep-copied Arrow RecordBatch objects
     """
     con = duckdb.connect(":memory:")
+    batch_count = 0
+    total_rows = 0
+    
     try:
+        # Read and filter data
         full_table = con.read_csv(file_path, header=False, sep="\n")
         rel = full_table.filter(f"column0 LIKE '{record_type}|%'").select(
             "string_split(column0, '|') AS fields_array"
         )
 
-        reader = rel.fetch_arrow_reader(batch_size=batch_size)
-        batch_count = 0
+        # Get expected total count for validation
+        expected_count = rel.count("*").fetchone()[0]
+        logger.debug(
+            f"Record type {record_type}: expecting {expected_count} total rows"
+        )
 
+        # Create Arrow reader with specified batch size
+        reader = rel.fetch_arrow_reader(batch_size=batch_size)
+
+        # Read all batches
         while True:
             try:
                 batch = reader.read_next_batch()
@@ -111,12 +122,34 @@ def create_batch_generator(
             safe_batch = safe_copy_batch(extracted_batch)
 
             batch_count += 1
+            total_rows += safe_batch.num_rows
             logger.info(
-                f"Record type {record_type}: batch {batch_count} ({safe_batch.num_rows} rows)"
+                f"Record type {record_type}: batch {batch_count} ({safe_batch.num_rows} rows, {total_rows}/{expected_count} total)"
             )
             yield safe_batch
+
+        # Validate all rows were yielded
+        if total_rows != expected_count:
+            logger.error(
+                f"Record type {record_type}: DATA LOSS! Yielded {total_rows} rows but expected {expected_count}"
+            )
+            raise ValueError(
+                f"Data loss detected for record type {record_type}: "
+                f"yielded {total_rows} rows but expected {expected_count}"
+            )
+
+        logger.success(
+            f"Record type {record_type}: Successfully yielded all {total_rows} rows in {batch_count} batches"
+        )
+        
+    except Exception as e:
+        logger.error(
+            f"Record type {record_type}: Error during batch generation after {batch_count} batches ({total_rows} rows): {e}"
+        )
+        raise
     finally:
         con.close()
+        logger.debug(f"Record type {record_type}: DuckDB connection closed")
 
 
 def resource_generator_factory(
