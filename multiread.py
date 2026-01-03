@@ -137,13 +137,21 @@ def resource_generator_factory(
 
 
 @dlt.source
-def multi_source(record_types: list[str], file_path: str, batch_size: int = 50_000):
+def multi_source(
+    record_types: list[str],
+    file_path: str,
+    batch_size: int = 50_000,
+    write_disposition: str = "replace",
+):
     """Multi-record source with single file read and partitioned streaming.
 
     Args:
         record_types: List of record type codes to extract
         file_path: Path to the multi-layout data file
-        batch_size: Number of rows per batch (DuckDB fetch_arrow_reader parameter)
+        batch_size: Number of rows per batch (DuckDB fetch_arrow_reader parameter).
+            Should align with max_buffer_size in dlt config for optimal performance.
+        write_disposition: Write mode for resources ("append", "replace", "merge").
+            Defaults to "replace" for deterministic behavior on reruns.
 
     Yields:
         dlt resources with extracted and transformed data
@@ -169,7 +177,7 @@ def multi_source(record_types: list[str], file_path: str, batch_size: int = 50_0
             yield dlt.resource(
                 gen_func,
                 name=f"record_{record_type}",
-                write_disposition="append",
+                write_disposition=write_disposition,
             )
 
         except Exception as e:
@@ -203,12 +211,14 @@ if __name__ == "__main__":
     )
 
     # Run pipeline with all record types and custom batch size
-    # Note: write_disposition moved to per-resource level for better control
+    # Note: batch_size should align with max_buffer_size in .dlt/config.toml
+    # for optimal performance (default: 50,000)
     load_info = pipeline.run(
         multi_source(
             record_types=record_types,
             file_path="/Users/rory/github/sandbox/multi_layout_data_xl.txt",
-            batch_size=25_000,  # Control batch size to manage memory
+            batch_size=50_000,  # Aligns with default max_buffer_size in config
+            write_disposition="replace",  # Prevents duplicates on reruns
         ),
     )
 
